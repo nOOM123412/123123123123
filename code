@@ -1,37 +1,265 @@
-# safari_test.py
-import time
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+# bot.py
+# Установка:
+#   pip install aiogram playwright python-dotenv aiosqlite
+#   playwright install chromium
 
-def main():
-    # Запуск Safari (SafariDriver встроен в macOS)
-    driver = webdriver.Safari()
+import asyncio
+import os
+import re
+from datetime import datetime, timedelta
+from pathlib import Path
 
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from playwright.async_api import async_playwright
+
+# ---------- Конфиг ----------
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError(f"BOT_TOKEN не задан. Проверь файл: {env_path}")
+
+CITY = "tyumen"
+QUERY = "Лукойл"
+STALE_HOURS = 2
+
+# Прокси — если 2ГИС блокирует по IP, впиши сюда российский прокси:
+# PROXY = {"server": "http://ip:port", "username": "user", "password": "pass"}
+PROXY = None
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Кэш в памяти
+stations_cache: list[dict] = []
+
+
+# ---------- Парсер 2ГИС ----------
+async def parse_2gis_fuel() -> list[dict]:
+    """Открывает 2ГИС и собирает данные об АЗС Лукойл в Тюмени."""
+    async with async_playwright() as p:
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-web-security",
+            "--no-sandbox",
+        ]
+
+        launch_kwargs = {
+            "headless": False,
+            "args": launch_args,
+        }
+        if PROXY:
+            launch_kwargs["proxy"] = PROXY
+
+        browser = await p.chromium.launch(**launch_kwargs)
+
+        context = await browser.new_context(
+            locale="ru-RU",
+            timezone_id="Asia/Yekaterinburg",
+            viewport={"width": 1600, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+        )
+        page = await context.new_page()
+
+        url = f"https://2gis.ru/{CITY}/search/{QUERY}"
+        print(f"🔍 Открываю: {url}")
+
+        # 3 попытки с паузой
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                await page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                break
+            except Exception as e:
+                last_error = e
+                print(f"⚠️ Попытка {attempt} не удалась: {e}")
+                if attempt < 3:
+                    await asyncio.sleep(6)
+        else:
+            await browser.close()
+            raise RuntimeError(f"2ГИС не открылся после 3 попыток: {last_error}")
+
+        # Ждём, пока прогрузится выдача
+        await page.wait_for_timeout(8000)
+
+        # Прокрутим страницу, чтобы подгрузились карточки
+        for _ in range(3):
+            await page.mouse.wheel(0, 1500)
+            await page.wait_for_timeout(1500)
+
+        # Забираем текст всей страницы
+        try:
+            body_text = await page.inner_text("body")
+        except Exception as e:
+            print(f"⚠️ Не удалось прочитать body: {e}")
+            body_text = ""
+
+        await browser.close()
+
+    if not body_text:
+        print("❌ Пустой ответ от 2ГИС")
+        return []
+
+    print(f"📄 Получено {len(body_text)} символов")
+    return _extract_stations(body_text)
+
+
+def _extract_stations(text: str) -> list[dict]:
+    """Разбирает текст страницы на отдельные АЗС."""
+    results = []
+    chunks = re.split(r"(?=Лукойл)", text)
+    now = datetime.now()
+
+    for chunk in chunks:
+        if "Лукойл" not in chunk:
+            continue
+
+        # Адрес
+        addr_match = re.search(
+            r"((?:ул\.|улица|проспект|тракт|шоссе|переулок|бульвар)[^\n,]{2,50},\s*\d+[А-Яа-я]?)",
+            chunk,
+        )
+        if not addr_match:
+            continue
+        address = addr_match.group(1).strip()
+
+        has_fuel = "Есть топливо" in chunk
+
+        fuel_types = []
+        for fuel in ["АИ-92", "АИ-95", "АИ-100", "92", "95", "100", "ДТ", "ДТ "]:
+            if fuel in chunk and fuel.replace("АИ-", "").replace(" ", "") not in [f.replace("АИ-", "").replace(" ", "") for f in fuel_types]:
+                fuel_types.append(fuel)
+
+        # Время обновления
+        updated_at = None
+        time_match = re.search(
+            r"Обновлено\s+(\d+)\s+(минут|мин|час|часа|часов|ч)\s+назад",
+            chunk,
+        )
+        if time_match:
+            amount = int(time_match.group(1))
+            unit = time_match.group(2)
+            if "час" in unit or unit == "ч":
+                delta = timedelta(hours=amount)
+            else:
+                delta = timedelta(minutes=amount)
+            updated_at = now - delta
+
+        results.append({
+            "address": address,
+            "has_fuel": has_fuel,
+            "fuel_types": fuel_types,
+            "updated_at": updated_at,
+        })
+
+    # Убираем дубли по адресу
+    seen = set()
+    unique = []
+    for r in results:
+        if r["address"] not in seen:
+            seen.add(r["address"])
+            unique.append(r)
+
+    print(f"✅ Извлечено АЗС: {len(unique)}")
+    return unique
+
+
+# ---------- Форматирование сообщения ----------
+def humanize(dt: datetime) -> str:
+    mins = int((datetime.now() - dt).total_seconds() // 60)
+    if mins < 1:
+        return "только что"
+    if mins < 60:
+        return f"{mins} мин назад"
+    return f"{mins // 60} ч назад"
+
+
+def build_message(stations: list[dict]) -> str:
+    if not stations:
+        return "_Данных пока нет. Нажми «🔄 Обновить данные»._"
+
+    now = datetime.now()
+    fresh, stale = [], []
+
+    for s in stations:
+        if not s["has_fuel"]:
+            continue
+        if s["updated_at"] is None:
+            stale.append(s)
+        elif now - s["updated_at"] > timedelta(hours=STALE_HOURS):
+            stale.append(s)
+        else:
+            fresh.append(s)
+
+    lines = ["*95-й сейчас есть тут:*\n"]
+
+    if fresh:
+        for s in fresh:
+            fuel = ", ".join(s["fuel_types"]) or "95"
+            lines.append(
+                f"✅ {s['address']} — {fuel} (обновлено {humanize(s['updated_at'])})"
+            )
+    else:
+        lines.append("_Свежих подтверждений нет._")
+
+    if stale:
+        lines.append("\n*⚠️ Возможно кончился:*\n")
+        for s in stale:
+            if s["updated_at"]:
+                lines.append(
+                    f"⚠️ {s['address']} — обновлено {humanize(s['updated_at'])}"
+                )
+            else:
+                lines.append(f"⚠️ {s['address']} — время обновления неизвестно")
+
+    return "\n".join(lines)
+
+
+def kb_main():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить данные", callback_data="refresh")],
+        ]
+    )
+
+
+# ---------- Хендлеры ----------
+@dp.message(Command("start"))
+async def cmd_start(msg: Message):
+    text = build_message(stations_cache)
+    await msg.answer(text, parse_mode="Markdown", reply_markup=kb_main())
+
+
+@dp.callback_query(lambda c: c.data == "refresh")
+async def cb_refresh(cb: CallbackQuery):
+    global stations_cache
+    await cb.answer("Ищу данные, подожди ~15 сек...")
     try:
-        url = "https://2gis.ru/tyumen/search/Лукойл%20АЗС"
-        print(f"Открываю: {url}")
-        driver.get(url)
+        stations_cache = await parse_2gis_fuel()
+    except Exception as e:
+        await cb.message.answer(f"⚠️ Ошибка парсинга: {e}")
+        return
 
-        # Safari грузит динамику медленно — даём 15 секунд
-        time.sleep(15)
+    text = build_message(stations_cache)
+    try:
+        await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_main())
+    except Exception:
+        await cb.message.answer(text, parse_mode="Markdown", reply_markup=kb_main())
 
-        print("=" * 60)
-        print("URL:", driver.current_url)
-        print("Title:", driver.title)
 
-        body = driver.find_element(By.TAG_NAME, "body").text
-        print(f"Длина body: {len(body)} символов")
-        print("--- Первые 2000 символов ---")
-        print(body[:2000])
-        print("=" * 60)
+# ---------- Запуск ----------
+async def main():
+    print("🤖 Бот запущен")
+    await dp.start_polling(bot)
 
-        # Оставляем окно открытым, чтобы глазами посмотреть
-        input("Нажми Enter в терминале, чтобы закрыть Safari...")
-
-    finally:
-        driver.quit()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
