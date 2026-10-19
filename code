@@ -1,0 +1,37 @@
+# safari_test.py
+import time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+def main():
+    # Запуск Safari (SafariDriver встроен в macOS)
+    driver = webdriver.Safari()
+
+    try:
+        url = "https://2gis.ru/tyumen/search/Лукойл%20АЗС"
+        print(f"Открываю: {url}")
+        driver.get(url)
+
+        # Safari грузит динамику медленно — даём 15 секунд
+        time.sleep(15)
+
+        print("=" * 60)
+        print("URL:", driver.current_url)
+        print("Title:", driver.title)
+
+        body = driver.find_element(By.TAG_NAME, "body").text
+        print(f"Длина body: {len(body)} символов")
+        print("--- Первые 2000 символов ---")
+        print(body[:2000])
+        print("=" * 60)
+
+        # Оставляем окно открытым, чтобы глазами посмотреть
+        input("Нажми Enter в терминале, чтобы закрыть Safari...")
+
+    finally:
+        driver.quit()
+
+if __name__ == "__main__":
+    main()
